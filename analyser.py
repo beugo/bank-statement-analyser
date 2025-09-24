@@ -165,11 +165,12 @@ def categorise_transactions(transactions, start_line, prev_totals, prev_income):
             idx, prev_txn, key, is_new = history.pop()
             if prev_txn['category'] == 'Income':
                 income_total -= prev_txn['amount']
-            else:
+            elif prev_txn['category'] != 'Skipped':
                 totals[prev_txn['category']] -= prev_txn['amount']
             if is_new:
                 del extra_categories[key]
-                del totals[prev_txn['category']]
+                if prev_txn['category'] in totals:
+                    del totals[prev_txn['category']]
             i = idx
             continue
 
