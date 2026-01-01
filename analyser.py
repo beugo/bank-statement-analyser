@@ -3,244 +3,289 @@ import csv
 import argparse
 import os
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from collections import defaultdict
+
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
 from rich.columns import Columns
-from rich.progress import track
+
 import matplotlib.pyplot as plt
 
 console = Console()
 
-# Default categories
 CATEGORIES = {
     '1': 'Groceries',
-    '2': 'Eating & drinking out',
-    '3': 'Alcohol',
-    '4': 'Home & garden',
-    '5': 'Transport & travel',
-    '6': 'Entertainment & events',
-    '7': 'Shopping & retail',
-    '8': 'Health & fitness',
-    '9': 'Subscriptions & apps',
-    '10': 'Miscellaneous',
+    '2': 'Eating out',
+    '3': 'Guinness',
+    '4': 'Homewares',
+    '5': 'Transport',
+    '6': 'Entertainment',
+    '7': 'Shopping',
+    '8': 'Fitness',
+    '9': 'Subscriptions',
+    '10': 'Rent',
+    '11': 'Miscellaneous',
 }
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Interactive transaction categoriser.")
-    parser.add_argument('transactions_csv', help='Path to transactions CSV')
-    parser.add_argument('-s', '--summary-file', default='summary.csv',
-                        help='Path to summary CSV (will resume totals if exists)')
-    parser.add_argument('-l', '--start-line', type=int, default=0,
-                        help='Index of transaction to start from (0-based)')
-    parser.add_argument('--from-date', help='Include transactions on/after this date (YYYY-MM-DD)')
-    parser.add_argument('--to-date', help='Include transactions on/before this date (YYYY-MM-DD)')
-    parser.add_argument('--pie-chart', default='summary.png', help='Output path for pie chart')
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Manual transaction categoriser.")
+    p.add_argument('transactions_csv', nargs='?', default=None, help='Path to transactions CSV')
+    p.add_argument('-s', '--summary-file', default='summary.csv',
+                   help='Path to summary CSV (balances will resume if exists)')
+    p.add_argument('-l', '--start-line', type=int, default=0,
+                   help='Index of transaction to start from (0-based)')
+    p.add_argument('--from-date', help='Include transactions on/after this date (YYYY-MM-DD)')
+    p.add_argument('--to-date', help='Include transactions on/before this date (YYYY-MM-DD)')
+    p.add_argument('--pie-chart', default='summary.png', help='Output path for pie chart')
+    p.add_argument('--chart-only', action='store_true',
+               help='Only regenerate the pie chart from the summary file and exit')
+    return p.parse_args()
 
+def to_decimal(s: str) -> Decimal:
+    s = (s or "").strip()
+    if not s:
+        return Decimal("0")
+    # remove commas and currency symbols if any sneak in
+    s = s.replace(",", "").replace("$", "").replace("£", "")
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return Decimal("0")
 
 def extract_transactions(csv_path, from_date=None, to_date=None):
-    transactions = []
+    txns = []
     fmt = '%Y-%m-%d'
-    start = datetime.strptime(from_date, fmt) if from_date else None
-    end = datetime.strptime(to_date, fmt) if to_date else None
+    start = datetime.strptime(from_date, fmt).date() if from_date else None
+    end = datetime.strptime(to_date, fmt).date() if to_date else None
+
     with open(csv_path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            date = datetime.strptime(row['Transaction Date'], '%d/%m/%Y')
-            if (start and date < start) or (end and date > end):
+            date_str = (row.get('Transaction Date') or '').strip()
+            if not date_str or date_str.lower() == 'transaction date':
+                # skip blank rows or repeated headers
                 continue
-            txn = {'date': row['Transaction Date'], 'merchant': row['Narration']}
-            if row['Debit']:
-                txn['amount'] = float(row['Debit'].replace(',', '').replace('$', '').strip())
-                txn['type'] = 'debit'
-            elif row['Credit']:
-                txn['amount'] = float(row['Credit'].replace(',', '').replace('$', '').strip())
-                txn['type'] = 'credit'
+
+            try:
+                d = datetime.strptime(date_str, '%d/%m/%Y').date()
+            except ValueError:
+                # skip rows with unexpected date formats
+                continue
+
+            if (start and d < start) or (end and d > end):
+                continue
+
+            debit = to_decimal(row.get('Debit', ''))
+            credit = to_decimal(row.get('Credit', ''))
+
+            # Your CSV uses negative numbers in Debit for spending.
+            # We'll build a single signed amount:
+            amount = Decimal("0")
+            if debit != 0:
+                amount = debit            # already negative for spending
+            elif credit != 0:
+                amount = credit           # positive
             else:
                 continue
-            transactions.append(txn)
-    return transactions
 
+            txns.append({
+                'date': row['Transaction Date'],
+                'merchant': row.get('Narration', ''),
+                'amount': amount,         # signed
+                'raw_debit': debit,
+                'raw_credit': credit,
+            })
+
+    return txns
 
 def load_summary(path):
-    totals = {}
-    income = 0.0
+    """
+    Summary is stored as:
+    Category, Balance
+    Groceries, -123.45
+    ...
+    (no special Income row; income is just positive amounts in categories or kept as 'Income' category)
+    """
+    balances = defaultdict(Decimal)
     if os.path.exists(path):
         with open(path, newline='', encoding='utf-8') as f:
             reader = csv.reader(f)
             next(reader, None)
             for cat, val in reader:
-                amt = float(val)
-                if cat == 'Income':
-                    income = amt
-                elif cat not in ('Total Expenses', 'Net Balance'):
-                    totals[cat] = amt
-    return totals, income
+                balances[cat] = to_decimal(val)
+    return balances
 
-
-def save_summary(path, totals, income):
-    total_expense = sum(totals.values())
+def save_summary(path, balances):
     with open(path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Category', 'Total'])
-        for cat, amt in totals.items():
-            writer.writerow([cat, f"{amt:.2f}"])
-        writer.writerow(['Income', f"{income:.2f}"])
-        writer.writerow(['Total Expenses', f"{total_expense:.2f}"])
-        writer.writerow(['Net Balance', f"{income - total_expense:.2f}"])
+        w = csv.writer(f)
+        w.writerow(['Category', 'Balance'])
+        for cat, bal in sorted(balances.items(), key=lambda x: x[0].lower()):
+            w.writerow([cat, f"{bal:.2f}"])
+
     console.print(f"\n✅ [bold green]Summary saved to [underline]{path}[/underline][/bold green]")
 
+def generate_pie_chart(balances, output_path='summary.png'):
+    # Spending only (negative balances)
+    items = [(cat, bal) for cat, bal in balances.items() if bal < 0]
 
-def generate_pie_chart(totals, output_path='summary.png'):
-    labels = []
-    values = []
-    for cat, amt in totals.items():
-        if amt > 0:
-            labels.append(cat)
-            values.append(amt)
-    if not values:
-        console.print("[bold red]No debit transactions to chart.[/bold red]")
+    if not items:
+        console.print("[bold red]No spending (negative balances) to chart.[/bold red]")
         return
 
-    # Custom autopct to show both percent and actual dollar value
-    def autopct_format(pct, allvals):
-        absolute = pct / 100 * sum(allvals)
-        return f"${absolute:.2f}\n({pct:.1f}%)"
+    # Sort largest spend first
+    items.sort(key=lambda x: x[1])  # most negative first
+
+    labels = [cat for cat, _ in items]
+    values = [float(-bal) for _, bal in items]  # positive magnitudes
+
+    total_spend = sum(values)
 
     fig, ax = plt.subplots()
-    ax.pie(
+
+    wedges, _, _ = ax.pie(
         values,
-        labels=labels,
-        autopct=lambda pct: autopct_format(pct, values),
-        startangle=90
+        autopct='%1.1f%%',
+        startangle=90,
+        pctdistance=0.75
     )
     ax.axis('equal')
-    plt.title('Spending by Category')
-    plt.savefig(output_path)
+
+    # Legend shows category + $ amount
+    legend_labels = [f"{cat} — {val:.2f}" for cat, val in zip(labels, values)]
+    ax.legend(
+        wedges,
+        legend_labels,
+        title=f"Total spend: {total_spend:.2f}",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0.0
+    )
+
+    plt.title('Spending by Category (net)')
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
     console.print(f"✅ [bold green]Pie chart saved to [underline]{output_path}[/underline][/bold green]")
+    console.print(f"[bold]Total spend (from negative balances):[/bold] {total_spend:.2f}")
 
+def render_balances(balances):
+    lines = []
+    for cat, bal in sorted(balances.items(), key=lambda x: x[0].lower()):
+        style = "green" if bal > 0 else "red" if bal < 0 else "white"
+        lines.append(f"[bold]{cat}[/bold]: [{style}]{bal:.2f}[/{style}]")
+    return "\n".join(lines) if lines else "(no balances yet)"
 
+def categorise_transactions(transactions, start_line, balances):
+    # ensure all default categories exist
+    for c in CATEGORIES.values():
+        balances.setdefault(c, Decimal("0"))
+    balances.setdefault("Income", Decimal("0"))  # optional bucket if you want it
 
-def categorise_transactions(transactions, start_line, prev_totals, prev_income):
-    totals = {**{c: 0.0 for c in CATEGORIES.values()}, **prev_totals}
-    income_total = prev_income
-    extra_categories = {}
     history = []
     i = start_line
     quit_early = False
+
     while i < len(transactions):
         txn = transactions[i]
-        # Display transaction
-        title_style = 'bold red' if txn['type'] == 'debit' else 'bold green'
+        amt = txn['amount']
+        kind = "CREDIT" if amt > 0 else "DEBIT" if amt < 0 else "ZERO"
+
+        title_style = 'bold green' if amt > 0 else 'bold red' if amt < 0 else 'bold yellow'
         panel = Panel(
             f"[bold yellow]Date:[/bold yellow] {txn['date']}\n"
             f"[bold cyan]Merchant:[/bold cyan] {txn['merchant']}\n"
-            f"[bold green]Amount:[/bold green] ${txn['amount']:.2f}\n",
-            title=f"[{title_style}]{txn['type'].capitalize()} Transaction[/{title_style}]"
+            f"[bold]Amount:[/bold] {amt:.2f}\n\n"
+            f"[dim]Current balances:[/dim]\n{render_balances(balances)}",
+            title=f"[{title_style}]{kind}[/{title_style}]"
         )
         console.print(panel)
 
-        combined = {**CATEGORIES, **extra_categories}
-        options = []
-        if txn['type'] == 'credit':
-            options.append(Text('[i] Income', style='bold magenta'))
-            options.append(Text('[c] Categorise', style='bold magenta'))
-        else:
-            for key, cat in combined.items():
-                options.append(Text(f"[{key}] {cat}", style='bold'))
-            options.append(Text('[n] New category', style='bold magenta'))
-        options.append(Text('[b] Back', style='bold magenta'))
-        options.append(Text('[q] Quit', style='bold magenta'))
+        combined = dict(CATEGORIES)  # only your numbered categories
+        options = [Text(f"[{k}] {v}", style='bold') for k, v in combined.items()]
+        options.append(Text("[i] Income (only for credits)", style="bold magenta"))
+        options.append(Text("[n] New category", style="bold magenta"))
+        options.append(Text("[b] Back", style="bold magenta"))
+        options.append(Text("[q] Quit", style="bold magenta"))
         console.print(Columns(options, equal=True, expand=True))
 
-        choice = console.input('[bold magenta]Choice:[/bold magenta] ').strip()
+        raw_choice = console.input('[bold magenta]Choice (Enter = skip):[/bold magenta] ')
+        choice = raw_choice.strip().lower()
+
+        if choice == '':
+            history.append((i, None, Decimal("0")))
+            i += 1
+            continue
+
         if choice in ('q', 'quit'):
             quit_early = True
             break
+
         if choice in ('b', 'back'):
             if not history:
                 console.print('[bold red]No action to go back to.[/bold red]')
                 continue
-            idx, prev_txn, key, is_new = history.pop()
-            if prev_txn['category'] == 'Income':
-                income_total -= prev_txn['amount']
-            elif prev_txn['category'] != 'Skipped':
-                totals[prev_txn['category']] -= prev_txn['amount']
-            if is_new:
-                del extra_categories[key]
-                if prev_txn['category'] in totals:
-                    del totals[prev_txn['category']]
+            idx, prev_category, prev_amount = history.pop()
+            if prev_category is not None:
+                balances[prev_category] -= prev_amount
             i = idx
             continue
 
-        if txn['type'] == 'credit':
-            if choice == 'i':
-                income_total += txn['amount']
-                txn['category'] = 'Income'
-                history.append((i, txn, 'i', False))
-                i += 1
+        if choice == 'i':
+            if amt <= 0:
+                console.print("[bold red]Income only makes sense for positive amounts.[/bold red]")
                 continue
-            elif choice == 'c':
-                sub = console.input('[bold magenta]Category key:[/bold magenta] ').strip()
-                if sub in combined:
-                    cat = combined[sub]
-                    totals[cat] -= txn['amount']
-                    txn['category'] = cat
-                    history.append((i, txn, sub, False))
-                else:
-                    txn['category'] = 'Uncategorised'
-                    history.append((i, txn, None, False))
-                i += 1
+            balances["Income"] += amt
+            history.append((i, "Income", amt))
+            i += 1
+            continue
+
+        if choice == 'n':
+            new_cat = console.input('New category name: ').strip()
+            if not new_cat:
+                console.print("[bold red]Category name cannot be empty.[/bold red]")
                 continue
-            else:
-                txn['category'] = 'Skipped'
-                history.append((i, txn, None, False))
-                i += 1
-                continue
+            balances.setdefault(new_cat, Decimal("0"))
+            balances[new_cat] += amt
+            history.append((i, new_cat, amt))
+            i += 1
+            continue
 
         if choice in combined:
             cat = combined[choice]
-            totals[cat] += txn['amount']
-            txn['category'] = cat
-            history.append((i, txn, choice, False))
-            i += 1
-            continue
-        if choice == 'n':
-            new_cat = console.input('New category name: ').strip()
-            next_key = str(max(int(k) for k in combined.keys()) + 1)
-            extra_categories[next_key] = new_cat
-            totals[new_cat] = txn['amount']
-            txn['category'] = new_cat
-            history.append((i, txn, next_key, True))
+            balances[cat] += amt
+            history.append((i, cat, amt))
             i += 1
             continue
 
-        txn['category'] = 'Skipped'
-        history.append((i, txn, None, False))
-        i += 1
+        console.print("[bold red]Invalid choice.[/bold red]")
 
-    return totals, income_total, quit_early
-
+    return balances, quit_early
 
 def main():
     args = parse_args()
-    prev_totals, prev_income = load_summary(args.summary_file)
+    balances = load_summary(args.summary_file)
+
+    if args.chart_only:
+        generate_pie_chart(balances, args.pie_chart)
+        return
+
+    if not args.transactions_csv:
+        console.print("[bold red]transactions_csv is required unless --chart-only is used.[/bold red]")
+        return
+
     txns = extract_transactions(args.transactions_csv, args.from_date, args.to_date)
-    
+
     if not txns:
         console.print("[bold red]No transactions found in the specified date range.[/bold red]")
         return
 
-    totals, income, quit_early = categorise_transactions(txns, args.start_line, prev_totals, prev_income)
-
-    # Always save summary and generate pie chart, even if quitting early
-    save_summary(args.summary_file, totals, income)
-    generate_pie_chart(totals, args.pie_chart)
+    balances, quit_early = categorise_transactions(txns, args.start_line, balances)
+    save_summary(args.summary_file, balances)
+    generate_pie_chart(balances, args.pie_chart)
 
     if quit_early:
         console.print("[bold yellow]Session ended early. Summary and pie chart generated for transactions processed so far.[/bold yellow]")
-
 
 if __name__ == '__main__':
     main()
